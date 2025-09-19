@@ -1,5 +1,6 @@
 mod args;
 mod errors;
+mod java_bridge;
 mod parser;
 mod prefetch_reader;
 mod rendered_result;

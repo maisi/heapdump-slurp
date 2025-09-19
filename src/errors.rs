@@ -15,6 +15,10 @@ pub enum HprofSlurpError {
     InvalidHprofFile { message: String },
     #[error("unsupported pointer size - {message:?}")]
     UnsupportedIdSize { message: String },
+    #[error("unsupported dump format - {message:?}")]
+    UnsupportedDumpFormat { message: String },
+    #[error("Java helper error - {message:?}")]
+    JavaHelperError { message: String },
     #[error("CLI argument error ({e})")]
     ClapError { e: clap::Error },
     #[error("standard I/O error ({e})")]

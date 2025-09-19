@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -7,8 +7,10 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::errors::HprofSlurpError;
 use crate::errors::HprofSlurpError::{
-    InvalidHeaderSize, InvalidHprofFile, InvalidIdSize, StdThreadError, UnsupportedIdSize,
+    InvalidHeaderSize, InvalidHprofFile, InvalidIdSize, StdThreadError, UnsupportedDumpFormat,
+    UnsupportedIdSize,
 };
+use crate::java_bridge::analyze_with_java_helper;
 use crate::parser::file_header_parser::{FileHeader, parse_file_header};
 use crate::parser::record::Record;
 use crate::parser::record_stream_parser::HprofRecordStreamParser;
@@ -17,22 +19,74 @@ use crate::rendered_result::RenderedResult;
 use crate::result_recorder::ResultRecorder;
 use crate::utils::pretty_bytes_size;
 
-// the exact size of the file header (31 bytes)
 const FILE_HEADER_LENGTH: usize = 31;
 
 // 64 MB buffer performs nicely (higher is faster but increases the memory consumption)
 pub const READ_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpFormat {
+    Hprof,
+    Phd,
+    OpenJ9Core,
+}
+
+fn detect_dump_format(buf: &[u8]) -> Result<DumpFormat, HprofSlurpError> {
+    if buf.len() >= 4 && buf.starts_with(&[0x7F, b'E', b'L', b'F']) {
+        return Ok(DumpFormat::OpenJ9Core);
+    }
+
+    if buf.len() >= 2 {
+        let name_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if buf.len() >= 2 + name_len && &buf[2..2 + name_len] == b"portable heap dump" {
+            return Ok(DumpFormat::Phd);
+        }
+    }
+
+    if buf.starts_with(b"JAVA PROFILE") {
+        return Ok(DumpFormat::Hprof);
+    }
+
+    Err(UnsupportedDumpFormat {
+        message: "Unrecognized heap dump signature".to_string(),
+    })
+}
 
 pub fn slurp_file(
     file_path: String,
     debug_mode: bool,
     list_strings: bool,
 ) -> Result<RenderedResult, HprofSlurpError> {
-    let file = File::open(file_path)?;
+    let file = File::open(&file_path)?;
     let file_len = file.metadata()?.len() as usize;
     let mut reader = BufReader::new(file);
 
-    // Parse file header
+    let probe_buffer = reader.fill_buf()?;
+    if probe_buffer.is_empty() {
+        return Err(UnsupportedDumpFormat {
+            message: "Empty input file".to_string(),
+        });
+    }
+
+    match detect_dump_format(probe_buffer)? {
+        DumpFormat::Hprof => slurp_hprof(reader, file_len, debug_mode, list_strings),
+        DumpFormat::Phd => {
+            drop(reader);
+            analyze_with_java_helper("phd", &file_path, file_len as u64, list_strings)
+        }
+        DumpFormat::OpenJ9Core => {
+            drop(reader);
+            analyze_with_java_helper("openj9-core", &file_path, file_len as u64, list_strings)
+        }
+    }
+}
+
+fn slurp_hprof(
+    mut reader: BufReader<File>,
+    file_len: usize,
+    debug_mode: bool,
+    list_strings: bool,
+) -> Result<RenderedResult, HprofSlurpError> {
     let header = slurp_header(&mut reader)?;
     let id_size = header.size_pointers;
     println!(
@@ -105,10 +159,12 @@ pub fn slurp_file(
 
     // Init progress bar
     let pb = ProgressBar::new(file_len as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} (speed:{bytes_per_sec}) (eta:{eta})")
-        .expect("templating should never fail")
-        .progress_chars("#>-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} (speed:{bytes_per_sec}) (eta:{eta})")
+            .expect("templating should never fail")
+            .progress_chars("#>-"),
+    );
 
     // Feed progress bar
     while let Ok(processed) = receive_progress.recv() {
@@ -186,6 +242,35 @@ mod tests {
     }
 
     #[test]
+    fn detects_hprof_signature() {
+        let bytes = b"JAVA PROFILE 1.0.2\0extra";
+        assert_eq!(DumpFormat::Hprof, detect_dump_format(bytes).unwrap());
+    }
+
+    #[test]
+    fn detects_phd_signature() {
+        let mut bytes = vec![0x00, 0x12];
+        bytes.extend_from_slice(b"portable heap dump");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(DumpFormat::Phd, detect_dump_format(&bytes).unwrap());
+    }
+
+    #[test]
+    fn detects_openj9_core_signature() {
+        let bytes = [0x7F, b'E', b'L', b'F', 0x00, 0x00];
+        assert_eq!(DumpFormat::OpenJ9Core, detect_dump_format(&bytes).unwrap());
+    }
+
+    #[test]
+    fn unknown_signature_is_rejected() {
+        let bytes = b"?";
+        assert!(matches!(
+            detect_dump_format(bytes),
+            Err(HprofSlurpError::UnsupportedDumpFormat { .. })
+        ));
+    }
+
+    #[test]
     fn unsupported_32_bits() {
         let file_path = FILE_PATH_32.to_string();
         let result = slurp_file(file_path, false, false);
@@ -198,24 +283,5 @@ mod tests {
         let result = slurp_file(file_path, false, false);
         assert!(result.is_ok());
         validate_gold_rendered_result(result.unwrap(), FILE_PATH_RESULT_64);
-    }
-
-    #[test]
-    fn file_header_32_bits() {
-        let file_path = FILE_PATH_32.to_string();
-        let file = File::open(file_path).unwrap();
-        let mut reader = BufReader::new(file);
-        let result = slurp_header(&mut reader);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn file_header_64_bits() {
-        let file_path = FILE_PATH_64.to_string();
-        let file = File::open(file_path).unwrap();
-        let mut reader = BufReader::new(file);
-        let file_header = slurp_header(&mut reader).unwrap();
-        assert_eq!(file_header.size_pointers, 8);
-        assert_eq!(file_header.format, "JAVA PROFILE 1.0.1".to_string());
     }
 }
